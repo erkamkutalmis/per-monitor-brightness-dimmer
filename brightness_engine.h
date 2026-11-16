@@ -1,0 +1,2445 @@
+// Per-monitor brightness engine.
+//
+// Two transports, picked per display at enumeration time:
+//   * DDC/CI  (external monitors) -- low-level VCP 0x10 over I2C. ~56 ms/write.
+//   * WMI     (internal laptop panels) -- WmiMonitorBrightnessMethods.
+//
+// DDC/CI displays can also carry contrast (VCP 0x12), power (0xD6), speaker
+// volume (0x62) and input selection (0x60), each probed separately: a monitor
+// that answers brightness does not necessarily answer any of them. Which
+// inputs exist only the monitor's capabilities string says, so that is read
+// too -- once, and in the background, because it is slow.
+//
+// Every hardware call happens on one worker thread. Callers post a target
+// percentage and return immediately; the worker coalesces, so a slider drag
+// that posts 200 values only puts as many on the wire as the bus can carry.
+//
+// Designed to be #included by the Windhawk mod as-is: no globals, no console,
+// no dependency on anything outside the Win32/COM SDK.
+
+#pragma once
+
+#include <windows.h>
+
+#include <lowlevelmonitorconfigurationapi.h>
+#include <physicalmonitorenumerationapi.h>
+
+#include <comdef.h>
+#include <wbemidl.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdarg>
+#include <cwctype>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace brightness {
+
+// Minimum gap between DDC/CI writes. Long enough that the shell's UI thread
+// gets the bus back and a slider tracks the pointer; short enough that an
+// external monitor still visibly follows a drag.
+inline constexpr std::chrono::milliseconds kDdcCooldown{140};
+
+// What other displays do when the internal panel's brightness changes on its
+// own -- function keys, mostly.
+enum class FollowMode {
+    Off,       // leave them alone
+    Match,     // set them to the same percentage
+    Relative,  // shift them by the same delta, preserving their offset
+};
+
+enum class Transport {
+    None,   // display found but no way to control it
+    DdcCi,  // external, VCP 0x10
+    Wmi,    // internal panel
+};
+
+// How "Reduce White Point" dims a display without touching its hardware
+// brightness slider (so 0-100% scales down into a lower nit range).
+enum class WhitePointMethod {
+    Auto,           // DDC/CI RGB gain (external) or GPU gamma ramp (SDR), with DWM fallback for HDR
+    GammaRamp,      // Per-monitor GPU gamma LUT (SetDeviceGammaRamp; SDR only)
+    DdcRgbGain,     // Per-monitor DDC/CI video gain R/G/B (VCP 0x16/0x18/0x1A)
+    Magnification,  // DWM fullscreen color matrix (works in HDR, Start Menu, Alt+Tab; global)
+};
+
+struct Display {
+    // Stable across reboots, hotplug and monitor reordering: derived from the
+    // EDID device instance path. HMONITOR is not stable, so it is never a key.
+    std::wstring stableId;
+    std::wstring name;           // "LS27F32xG", "Built-in display"
+    std::wstring gdiDeviceName;  // "\\.\DISPLAY5"
+    RECT rect{};
+    bool isPrimary = false;  // @harness-only
+    Transport transport = Transport::None;
+    int percent = -1;  // last known, -1 if never read
+    bool whitePointReduced = false;
+
+    // DdcCi
+    HANDLE hPhysical = nullptr;
+    DWORD vcpMax = 100;  // raw scale; a Samsung G32 reports 50, not 100
+
+    // Contrast, VCP 0x12. DDC/CI only; contrastMax stays 0 for a display that
+    // does not answer it, and contrast stays -1 until it is read.
+    int contrast = -1;
+    DWORD contrastMax = 0;
+
+    // Power, VCP 0xD6. Only a display that reports an actual power state gets
+    // a button: plenty of monitors answer the read with 0, which is no state
+    // at all, and ignore writes to it.
+    bool hasPower = false;
+    bool poweredOff = false;
+
+    // Speaker volume, VCP 0x62, for monitors with audio.
+    int volume = -1;
+    DWORD volumeMax = 0;
+
+    // Input source, VCP 0x60: the values the monitor lists in its
+    // capabilities, and which of them is current -- -1 when that is not known,
+    // since some monitors answer the read with a value their own list does
+    // not contain.
+    std::vector<int> inputs;
+    int input = -1;
+
+    // Wmi
+    std::wstring wmiPath;  // __RELPATH of the WmiMonitorBrightnessMethods instance
+};
+
+namespace detail {
+
+// Runs a thread body so that nothing can escape it.
+//
+// This is not defensive tidiness. An exception leaving a thread procedure
+// calls std::terminate(), which aborts the *host* process -- and everything
+// below talks to COM, WMI and I2C, all of which fail in ways that throw when
+// the shell is still starting up and those services are not ready yet. An
+// unguarded throw here takes ShellHost down, and it restarts into the same
+// throw, so the shell never comes back.
+// `report` takes (where, what) and is expected to log; it must not throw.
+template <class Fn, class Report>
+void RunGuarded(const wchar_t* where, Fn&& fn, Report&& report) noexcept {
+    try {
+        fn();
+    } catch (const _com_error& e) {
+        // swprintf, not wsprintf: wsprintf does not bound its output to the
+        // destination, and _com_error::ErrorMessage() can carry an arbitrarily
+        // long IErrorInfo description from a WMI provider.
+        wchar_t buf[512] = {};
+        swprintf(buf, ARRAYSIZE(buf), L"_com_error %08X (%ls)",
+                 static_cast<unsigned>(e.Error()),
+                 e.ErrorMessage() ? e.ErrorMessage() : L"?");
+        report(where, buf);
+    } catch (const std::exception& e) {
+        // Zero-initialised and checked: MultiByteToWideChar returns 0 without
+        // touching the buffer when the message does not fit, and the result is
+        // handed straight to a %ls.
+        wchar_t buf[512] = {};
+        if (MultiByteToWideChar(CP_ACP, 0, e.what(), -1, buf, 512) == 0) {
+            report(where, L"(exception message too long to convert)");
+        } else {
+            report(where, buf);
+        }
+    } catch (...) {
+        report(where, L"unknown exception");
+    }
+}
+
+
+inline std::wstring GetStrProp(IWbemClassObject* obj, const wchar_t* name) {
+    VARIANT v;
+    VariantInit(&v);
+    std::wstring out;
+    if (SUCCEEDED(obj->Get(name, 0, &v, nullptr, nullptr)) && v.vt == VT_BSTR &&
+        v.bstrVal) {
+        out = v.bstrVal;
+    }
+    VariantClear(&v);
+    return out;
+}
+
+inline int GetIntProp(IWbemClassObject* obj, const wchar_t* name) {
+    VARIANT v;
+    VariantInit(&v);
+    int out = -1;
+    if (SUCCEEDED(obj->Get(name, 0, &v, nullptr, nullptr))) {
+        switch (v.vt) {
+            case VT_I4:
+                out = v.lVal;
+                break;
+            case VT_UI1:
+                out = v.bVal;
+                break;
+            case VT_I2:
+                out = v.iVal;
+                break;
+            case VT_UI4:
+                out = static_cast<int>(v.ulVal);
+                break;
+            default:
+                break;
+        }
+    }
+    VariantClear(&v);
+    return out;
+}
+
+// WMI exposes uint16[] (e.g. UserFriendlyName) as a SAFEARRAY of VT_I4.
+inline std::wstring GetU16ArrayProp(IWbemClassObject* obj, const wchar_t* name) {
+    VARIANT v;
+    VariantInit(&v);
+    std::wstring out;
+    if (SUCCEEDED(obj->Get(name, 0, &v, nullptr, nullptr)) && (v.vt & VT_ARRAY) &&
+        v.parray) {
+        SAFEARRAY* sa = v.parray;
+        VARTYPE elem = static_cast<VARTYPE>(v.vt & VT_TYPEMASK);
+        LONG lb = 0, ub = -1;
+        SafeArrayGetLBound(sa, 1, &lb);
+        SafeArrayGetUBound(sa, 1, &ub);
+        // SafeArrayGetElement writes SafeArrayGetElemsize(sa) bytes into the
+        // destination, so the element type has to be one we have actually
+        // sized a slot for. WmiMonitorID.UserFriendlyName is uint16[], which
+        // arrives as VT_I4, but bail rather than smash the stack if a future
+        // property hands us something wider.
+        if (elem != VT_UI1 && elem != VT_I2 && elem != VT_UI2 &&
+            elem != VT_I4 && elem != VT_UI4) {
+            VariantClear(&v);
+            return out;
+        }
+        for (LONG i = lb; i <= ub; ++i) {
+            LONG ch = 0;
+            if (elem == VT_UI1) {
+                BYTE b = 0;
+                if (FAILED(SafeArrayGetElement(sa, &i, &b))) {
+                    break;
+                }
+                ch = b;
+            } else if (elem == VT_I2 || elem == VT_UI2) {
+                SHORT w = 0;
+                if (FAILED(SafeArrayGetElement(sa, &i, &w))) {
+                    break;
+                }
+                ch = static_cast<unsigned short>(w);
+            } else {
+                if (FAILED(SafeArrayGetElement(sa, &i, &ch))) {
+                    break;
+                }
+            }
+            if (ch == 0) {
+                break;
+            }
+            out.push_back(static_cast<wchar_t>(ch));
+        }
+    }
+    VariantClear(&v);
+    return out;
+}
+
+inline std::wstring ToLower(std::wstring s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](wchar_t c) { return static_cast<wchar_t>(towlower(c)); });
+    return s;
+}
+
+// "\\?\DISPLAY#SAM78C9#5&31ef9774&0&UID4352#{guid}"
+//   -> "DISPLAY\SAM78C9\5&31ef9774&0&UID4352"
+// which is the WMI InstanceName minus its "_0" suffix.
+inline std::wstring DeviceInterfaceToInstanceId(std::wstring s) {
+    if (s.rfind(L"\\\\?\\", 0) == 0) {
+        s.erase(0, 4);
+    }
+    size_t guid = s.rfind(L'#');
+    if (guid != std::wstring::npos) {
+        s.erase(guid);
+    }
+    std::replace(s.begin(), s.end(), L'#', L'\\');
+    return s;
+}
+
+}  // namespace detail
+
+// Thin wrapper over root\wmi. Lives entirely on the worker thread, so the
+// interface pointers never cross an apartment.
+class WmiSession {
+   public:
+    WmiSession() = default;
+    WmiSession(const WmiSession&) = delete;
+    WmiSession& operator=(const WmiSession&) = delete;
+
+    ~WmiSession() {
+        if (setBrightnessInDef_) {
+            setBrightnessInDef_->Release();
+        }
+        if (brightnessClass_) {
+            brightnessClass_->Release();
+        }
+        if (services_) {
+            services_->Release();
+        }
+        if (locator_) {
+            locator_->Release();
+        }
+    }
+
+    bool Init() {
+        HRESULT hr = CoCreateInstance(CLSID_WbemLocator, nullptr,
+                                      CLSCTX_INPROC_SERVER, IID_IWbemLocator,
+                                      reinterpret_cast<LPVOID*>(&locator_));
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        hr = locator_->ConnectServer(_bstr_t(L"root\\wmi"), nullptr, nullptr,
+                                     nullptr, 0, nullptr, nullptr, &services_);
+        if (FAILED(hr)) {
+            return false;
+        }
+
+        CoSetProxyBlanket(services_, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE,
+                          nullptr, RPC_C_AUTHN_LEVEL_CALL,
+                          RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE);
+        return true;
+    }
+
+    // Lets a long enumeration give up when the engine is shutting down.
+    void SetStopFlag(const std::atomic<bool>* stopping) { stopping_ = stopping; }
+
+    IWbemServices* Services() const { return services_; }
+
+   private:
+    const std::atomic<bool>* stopping_ = nullptr;
+
+   public:
+
+    template <class Fn>
+    void ForEach(const wchar_t* wql, Fn&& fn) {
+        if (!services_) {
+            return;
+        }
+        IEnumWbemClassObject* e = nullptr;
+        HRESULT hr = services_->ExecQuery(
+            _bstr_t(L"WQL"), _bstr_t(wql),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, nullptr, &e);
+        if (FAILED(hr) || !e) {
+            return;
+        }
+        // Bounded, not WBEM_INFINITE. A wedged or slow WMI provider is a
+        // common enough failure, and this runs on the worker thread that
+        // Wh_ModUninit joins -- an unbounded wait there hangs the unload, so
+        // the mod can neither be disabled nor updated.
+        for (;;) {
+            if (stopping_ && stopping_->load()) {
+                break;
+            }
+            IWbemClassObject* obj = nullptr;
+            ULONG got = 0;
+            HRESULT next = e->Next(1000, 1, &obj, &got);
+            if (next == WBEM_S_TIMEDOUT) {
+                continue;  // re-check the stop flag and keep waiting
+            }
+            if (next != S_OK || got != 1) {
+                break;  // exhausted or failed
+            }
+            fn(obj);
+            obj->Release();
+        }
+        e->Release();
+    }
+
+    bool SetBrightness(const std::wstring& objectPath, int percent) {
+        if (!services_ || objectPath.empty()) {
+            return false;
+        }
+        if (!brightnessClass_) {
+            if (FAILED(services_->GetObject(
+                    _bstr_t(L"WmiMonitorBrightnessMethods"), 0, nullptr,
+                    &brightnessClass_, nullptr))) {
+                return false;
+            }
+            if (FAILED(brightnessClass_->GetMethod(
+                    L"WmiSetBrightness", 0, &setBrightnessInDef_, nullptr))) {
+                return false;
+            }
+        }
+
+        IWbemClassObject* in = nullptr;
+        if (FAILED(setBrightnessInDef_->SpawnInstance(0, &in)) || !in) {
+            return false;
+        }
+
+        VARIANT v;
+        VariantInit(&v);
+        v.vt = VT_I4;
+        v.lVal = 0;  // Timeout: apply immediately, never revert
+        in->Put(L"Timeout", 0, &v, 0);
+        VariantClear(&v);
+
+        VariantInit(&v);
+        v.vt = VT_UI1;
+        v.bVal = static_cast<BYTE>(std::clamp(percent, 0, 100));
+        in->Put(L"Brightness", 0, &v, 0);
+        VariantClear(&v);
+
+        HRESULT hr = services_->ExecMethod(
+            _bstr_t(objectPath.c_str()), _bstr_t(L"WmiSetBrightness"), 0,
+            nullptr, in, nullptr, nullptr);
+        in->Release();
+        return SUCCEEDED(hr);
+    }
+
+   private:
+    IWbemLocator* locator_ = nullptr;
+    IWbemServices* services_ = nullptr;
+    IWbemClassObject* brightnessClass_ = nullptr;
+    IWbemClassObject* setBrightnessInDef_ = nullptr;
+};
+
+class Engine {
+   public:
+    using LogFn = void (*)(const wchar_t*);
+
+    Engine() = default;
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
+    ~Engine() { Stop(); }
+
+    void SetLogger(LogFn fn) { log_ = fn; }
+
+    // Per-write logging is invaluable while debugging and pure noise in daily
+    // use, so it is off unless asked for.
+
+    void SetFollowMode(FollowMode mode) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        followMode_ = mode;
+    }
+
+    void SetWhitePointConfig(int reducePercent, WhitePointMethod method) {
+        bool needReapply = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            int clamped = std::clamp(reducePercent, 10, 99);
+            if (whitePointReducePercent_ != clamped || whitePointMethod_ != method) {
+                whitePointReducePercent_ = clamped;
+                whitePointMethod_ = method;
+                for (const auto& id : whitePointReducedIds_) {
+                    pendingWhitePoint_[id] = true;
+                    needReapply = true;
+                }
+            }
+        }
+        if (needReapply) {
+            work_.notify_all();
+        }
+    }
+
+    void SetWhitePointSchedule(bool enabled, int startMin, int endMin) {
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            int clampedStart = std::clamp(startMin, 0, 24 * 60 - 1);
+            int clampedEnd = std::clamp(endMin, 0, 24 * 60 - 1);
+            if (whitePointScheduleEnabled_ != enabled ||
+                whitePointScheduleStartMin_ != clampedStart ||
+                whitePointScheduleEndMin_ != clampedEnd) {
+                whitePointScheduleEnabled_ = enabled;
+                whitePointScheduleStartMin_ = clampedStart;
+                whitePointScheduleEndMin_ = clampedEnd;
+                if (enabled) {
+                    whitePointScheduleEvalImmediate_ = true;
+                }
+                changed = true;
+            }
+        }
+        if (changed) {
+            work_.notify_all();
+        }
+    }
+
+    void Start() {
+        if (worker_.joinable()) {
+            return;
+        }
+        quit_ = false;
+        worker_ = std::thread(
+            [this] { detail::RunGuarded(
+                    L"WorkerMain", [this] { WorkerMain(); },
+                    [this](const wchar_t* w, const wchar_t* what) {
+                        Log(L"%ls threw: %ls", w, what);
+                    }); });
+
+        // Blocking on purpose, and safe because of when this is called.
+        //
+        // The first enumeration talks to WMI and does an I2C round trip per
+        // external monitor, so it is not fast. That is fine here: the mod does
+        // not call Start() from Wh_ModInit -- it waits until the host is up
+        // (see StartEngineIfNeeded in the mod) precisely because touching COM
+        // before then aborts the shell. By the time we get here the host has
+        // finished starting and nothing of its is being delayed.
+        //
+        // Still bounded, so a wedged WMI connection cannot hang the caller.
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ready_.wait_for(lock, std::chrono::seconds(5),
+                            [this] { return enumerated_ || quit_; });
+        }
+    }
+
+    void Stop() {
+        // Set before the lock so anything already inside a long hardware or
+        // WMI call can notice and unwind, rather than being noticed only when
+        // it next comes back around to the loop condition.
+        stopping_.store(true);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            quit_ = true;
+        }
+        work_.notify_all();
+        ready_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+        if (eventThread_.joinable()) {
+            eventThread_.join();
+        }
+    }
+
+    // Snapshot for the UI. Ordered left-to-right by desktop position, so the
+    // slider order matches how the monitors physically sit on the desk.
+    std::vector<Display> GetDisplays() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return displays_;
+    }
+
+    // Non-blocking. Repeated calls for the same display collapse into a single
+    // hardware write, so a slider drag can never outrun the I2C bus.
+    // Setting a display explicitly -- the slider, or anything else the user
+    // drove -- is what re-bases relative following on that display. Note that
+    // a refresh deliberately does not: the hardware reports the clamped value,
+    // so re-basing on a read would throw away the very offset followRaw_
+    // exists to remember.
+    void SetPercent(const std::wstring& stableId, int percent) {
+        SetPercentInternal(stableId, percent, /*rebaseFollow=*/true);
+    }
+
+    // Contrast, coalesced exactly like brightness. Displays without contrast
+    // ignore it.
+    void SetContrast(const std::wstring& stableId, int percent) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            bool known = false;
+            for (auto& d : displays_) {
+                if (d.stableId == stableId && d.contrastMax > 0) {
+                    d.contrast = std::clamp(percent, 0, 100);
+                    known = true;
+                }
+            }
+            if (!known) {
+                return;
+            }
+            pendingContrast_[stableId] = std::clamp(percent, 0, 100);
+        }
+        work_.notify_all();
+    }
+
+    // Speaker volume, coalesced like brightness.
+    void SetVolume(const std::wstring& stableId, int percent) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Display* d = FindLocked(stableId);
+            if (!d || d->volumeMax == 0) {
+                return;
+            }
+            d->volume = std::clamp(percent, 0, 100);
+            pendingVcp_[{stableId, kVcpVolume}] =
+                static_cast<DWORD>((d->volume * d->volumeMax + 50) / 100);
+        }
+        work_.notify_all();
+    }
+
+    // Switches the monitor to one of the inputs it lists. Switching away from
+    // the one this PC is on hands the monitor to whatever is on the other
+    // input; whether it still answers DDC/CI from here afterwards depends on
+    // the monitor.
+    void SetInput(const std::wstring& stableId, int value) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Display* d = FindLocked(stableId);
+            if (!d || std::find(d->inputs.begin(), d->inputs.end(), value) == d->inputs.end()) {
+                return;
+            }
+            d->input = value;
+            pendingVcp_[{stableId, kVcpInput}] = static_cast<DWORD>(value);
+        }
+        work_.notify_all();
+    }
+
+    // Turns a display off (DPM off) or back on. Off is 0x04 rather than 0x05:
+    // 0x05 is the monitor's own power button, after which many monitors stop
+    // listening on DDC/CI altogether, whereas one in DPM off usually still
+    // answers the 0x01 that turns it back on. Usually -- some do not, and then
+    // only the monitor's own button brings it back.
+    void SetPower(const std::wstring& stableId, bool on) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            bool known = false;
+            for (auto& d : displays_) {
+                if (d.stableId == stableId && d.hasPower) {
+                    d.poweredOff = !on;
+                    known = true;
+                }
+            }
+            if (!known) {
+                return;
+            }
+            pendingPower_[stableId] = on;
+        }
+        work_.notify_all();
+    }
+
+    void SetWhitePointReduced(const std::wstring& stableId, bool reduced) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Display* d = FindLocked(stableId);
+            if (!d) {
+                return;
+            }
+            d->whitePointReduced = reduced;
+            if (reduced) {
+                whitePointReducedIds_.insert(stableId);
+            } else {
+                whitePointReducedIds_.erase(stableId);
+            }
+            SaveWhitePointEntry(stableId, reduced);
+            pendingWhitePoint_[stableId] = reduced;
+        }
+        work_.notify_all();
+    }
+
+    bool ToggleWhitePointReduced(const std::wstring& stableId) {
+        bool next = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            Display* d = FindLocked(stableId);
+            if (!d) {
+                return false;
+            }
+            next = !d->whitePointReduced;
+            d->whitePointReduced = next;
+            if (next) {
+                whitePointReducedIds_.insert(stableId);
+            } else {
+                whitePointReducedIds_.erase(stableId);
+            }
+            SaveWhitePointEntry(stableId, next);
+            pendingWhitePoint_[stableId] = next;
+        }
+        work_.notify_all();
+        return next;
+    }
+
+   private:
+    void SetPercentInternal(const std::wstring& stableId, int percent,
+                            bool rebaseFollow) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (rebaseFollow) {
+                followRaw_.erase(stableId);
+            }
+            // Stamped on request, not on completion: a drag keeps refreshing
+            // this, so the whole drag plus its trailing echoes stay covered.
+            lastRequest_[stableId] = std::chrono::steady_clock::now();
+            pending_[stableId] = std::clamp(percent, 0, 100);
+            // Reflect optimistically so the UI stays glued to the thumb.
+            for (auto& d : displays_) {
+                if (d.stableId == stableId) {
+                    d.percent = std::clamp(percent, 0, 100);
+                }
+            }
+        }
+        work_.notify_all();
+    }
+
+   public:
+    void RequestRescan() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            rescan_ = true;
+        }
+        work_.notify_all();
+    }
+
+    // Re-read what the hardware actually reports, for when brightness was
+    // changed behind our back -- laptop function keys, the monitor's own OSD,
+    // or another application.
+    void RequestRefresh() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            refresh_ = true;
+        }
+        work_.notify_all();
+    }
+
+    // Called on the worker thread once the display list changed (structural =
+    // true) or once values were re-read (false). The callee is responsible for
+    // marshalling to whatever thread it needs.
+    void SetOnChanged(std::function<void(bool)> fn) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        onChanged_ = std::move(fn);
+    }
+
+    // Diagnostics for the standalone harness. build_mod.sh strips these
+    // and everything else tagged @harness-only out of the mod.
+    unsigned Writes() const { return writes_.load(); }  // @harness-only
+    void ResetWrites() { writes_.store(0); }  // @harness-only
+
+   private:
+    static constexpr BYTE kVcpLuminance = 0x10;
+    static constexpr BYTE kVcpContrast = 0x12;
+    static constexpr BYTE kVcpPower = 0xD6;
+    static constexpr DWORD kPowerOn = 0x01;
+    static constexpr DWORD kPowerOff = 0x04;  // DPM off; see SetPower
+    static constexpr BYTE kVcpVolume = 0x62;
+    static constexpr BYTE kVcpInput = 0x60;
+    static constexpr BYTE kVcpRedGain = 0x16;
+    static constexpr BYTE kVcpGreenGain = 0x18;
+    static constexpr BYTE kVcpBlueGain = 0x1A;
+
+    // Caller holds mutex_.
+    Display* FindLocked(const std::wstring& stableId) {
+        for (auto& d : displays_) {
+            if (d.stableId == stableId) {
+                return &d;
+            }
+        }
+        return nullptr;
+    }
+
+    // What a monitor's capabilities string says about the VCP codes it
+    // implements: each code, and the values it lists for it, if any.
+    struct Capabilities {
+        bool loaded = false;
+        std::map<int, std::vector<int>> vcp;
+    };
+
+    static int HexDigit(char c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    }
+
+    // "...vcp(02 04 10 12 14(05 08 0B) 60(11 12 ) 62 8D)..." -> {0x02: {},
+    // ..., 0x14: {5, 8, 11}, 0x60: {0x11, 0x12}, ...}. Codes are read two hex
+    // digits at a time, which also covers the monitors that pack the list
+    // with no spaces at all.
+    static Capabilities ParseCapabilities(const std::string& text) {
+        Capabilities caps;
+        std::string lower = text;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](char c) { return static_cast<char>(tolower(static_cast<unsigned char>(c))); });
+        size_t at = lower.find("vcp(");
+        if (at == std::string::npos) {
+            return caps;
+        }
+        size_t i = at + 4;
+        auto readByte = [&](size_t& k) -> int {
+            while (k < text.size() && text[k] == ' ') ++k;
+            if (k + 1 < text.size() && HexDigit(text[k]) >= 0 && HexDigit(text[k + 1]) >= 0) {
+                int v = HexDigit(text[k]) * 16 + HexDigit(text[k + 1]);
+                k += 2;
+                return v;
+            }
+            return -1;
+        };
+        while (i < text.size()) {
+            while (i < text.size() && text[i] == ' ') ++i;
+            if (i >= text.size() || text[i] == ')') {
+                break;
+            }
+            int code = readByte(i);
+            if (code < 0) {
+                ++i;  // something unexpected; skip it rather than stop
+                continue;
+            }
+            std::vector<int>& values = caps.vcp[code];
+            while (i < text.size() && text[i] == ' ') ++i;
+            if (i < text.size() && text[i] == '(') {
+                ++i;
+                int depth = 1;
+                while (i < text.size() && depth > 0) {
+                    while (i < text.size() && text[i] == ' ') ++i;
+                    if (i >= text.size()) break;
+                    if (text[i] == '(') {
+                        ++depth;
+                        ++i;
+                    } else if (text[i] == ')') {
+                        --depth;
+                        ++i;
+                    } else {
+                        int v = readByte(i);
+                        if (v < 0) {
+                            ++i;
+                        } else if (depth == 1) {
+                            values.push_back(v);
+                        }
+                    }
+                }
+            }
+        }
+        caps.loaded = true;
+        return caps;
+    }
+
+    static Capabilities ReadCapabilities(HANDLE hPhysical) {
+        DWORD length = 0;
+        if (!GetCapabilitiesStringLength(hPhysical, &length) || length == 0 ||
+            length > 16384) {
+            return {};
+        }
+        std::string text(length, '\0');
+        if (!CapabilitiesRequestAndCapabilitiesReply(hPhysical, text.data(), length)) {
+            return {};
+        }
+        text.resize(strnlen(text.c_str(), length));
+        return ParseCapabilities(text);
+    }
+
+    // Caller holds mutex_, or owns d outright (Rescan, before publishing).
+    static void ApplyCapabilities(Display& d, const Capabilities& caps) {
+        auto input = caps.vcp.find(0x60);
+        if (input != caps.vcp.end() && input->second.size() >= 2) {
+            d.inputs = input->second;
+        }
+    }
+
+    // The capabilities string takes a second or more per monitor, so it is
+    // read once per display per session, after the displays are already up,
+    // rather than as part of enumerating them.
+    //
+    // Only a read that worked is kept. One that fails -- a monitor still
+    // waking, a dock still enumerating -- is tried again on the next rescan,
+    // up to kCapsAttempts times per connection, so a monitor that never
+    // answers it costs no more than that. Unplugging a monitor forgets both
+    // (see Rescan), so plugging it back in starts over. Worker thread; returns
+    // whether any display changed.
+    bool LoadCapabilities() {
+        std::vector<std::pair<std::wstring, HANDLE>> todo;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& d : displays_) {
+                if (d.transport == Transport::DdcCi && d.hPhysical &&
+                    !caps_.count(d.stableId) &&
+                    capsAttempts_[d.stableId] < kCapsAttempts) {
+                    todo.emplace_back(d.stableId, d.hPhysical);
+                }
+            }
+        }
+        bool changed = false;
+        for (const auto& entry : todo) {
+            if (stopping_.load()) {
+                break;
+            }
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            Capabilities caps = ReadCapabilities(entry.second);
+            if (caps.loaded) {
+                caps_[entry.first] = caps;
+            } else {
+                ++capsAttempts_[entry.first];
+            }
+            long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - start)
+                               .count();
+            Log(L"capabilities %ls: %ls, %zu code(s) (%lld ms)", entry.first.c_str(),
+                caps.loaded ? L"read" : L"unavailable", caps.vcp.size(), ms);
+            if (caps.loaded) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (Display* d = FindLocked(entry.first)) {
+                    ApplyCapabilities(*d, caps);
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+
+    void Log(const wchar_t* fmt, ...) {
+        if (!log_) {
+            return;
+        }
+        wchar_t buf[512];
+        va_list args;
+        va_start(args, fmt);
+        vswprintf(buf, sizeof(buf) / sizeof(buf[0]), fmt, args);
+        va_end(args);
+        log_(buf);
+    }
+
+    void WorkerMain() {
+        HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+        // Deliberately no CoInitializeSecurity: it is process-wide, so calling
+        // it would impose this thread's settings on the whole host.
+        // CoSetProxyBlanket on the IWbemServices proxy is what actually governs
+        // our WMI calls.
+
+        // Created here, not as a plain member: these interface pointers belong
+        // to this thread's apartment and must not outlive it. Releasing them
+        // from ~Engine() on another thread, after the CoUninitialize() below,
+        // is a crash.
+        wmi_ = std::make_unique<WmiSession>();
+        wmi_->SetStopFlag(&stopping_);
+        wmi_->Init();
+
+        LoadWhitePointState();
+        Rescan();
+
+        // Re-apply persisted Reduce White Point state (e.g. after ShellHost.exe
+        // was recycled by Windows while idle).
+        {
+            std::vector<std::wstring> toApply;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                for (const auto& d : displays_) {
+                    if (d.whitePointReduced) {
+                        toApply.push_back(d.stableId);
+                    }
+                }
+            }
+            for (const auto& id : toApply) {
+                ApplyWhitePoint(id, true);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            enumerated_ = true;
+        }
+        ready_.notify_all();
+        NotifyChanged(true);
+
+        // After the panel has its rows, not before: this is the slow part.
+        if (LoadCapabilities()) {
+            NotifyChanged(true);
+        }
+
+        // Only worth a thread if something here reports brightness events;
+        // DDC/CI has no equivalent, so this is the internal panel only.
+        bool haveWmiPanel = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& d : displays_) {
+                if (d.transport == Transport::Wmi) {
+                    haveWmiPanel = true;
+                    break;
+                }
+            }
+        }
+        if (haveWmiPanel) {
+            eventThread_ = std::thread([this] {
+                detail::RunGuarded(
+                    L"EventThreadMain", [this] { EventThreadMain(); },
+                    [this](const wchar_t* w, const wchar_t* what) {
+                        Log(L"%ls threw: %ls", w, what);
+                    });
+            });
+        }
+
+        for (;;) {
+            std::map<std::wstring, int> batch;
+            std::map<std::wstring, int> contrastBatch;
+            std::map<std::wstring, bool> powerBatch;
+            std::map<std::pair<std::wstring, BYTE>, DWORD> vcpBatch;
+            std::map<std::wstring, bool> whitePointBatch;
+            bool doRescan = false;
+            bool doRefresh = false;
+            bool schedEnabled = false;
+            int schedStartMin = 20 * 60;
+            int schedEndMin = 5 * 60;
+            bool schedEvalImmediate = false;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                auto hasWork = [this] {
+                    return quit_ || rescan_ || refresh_ || !pending_.empty() ||
+                           !pendingContrast_.empty() || !pendingPower_.empty() ||
+                           !pendingVcp_.empty() || !pendingWhitePoint_.empty() ||
+                           whitePointScheduleEvalImmediate_;
+                };
+                if (whitePointScheduleEnabled_) {
+                    work_.wait_for(lock, std::chrono::seconds(20), hasWork);
+                } else {
+                    work_.wait(lock, hasWork);
+                }
+                if (quit_) {
+                    break;
+                }
+                doRescan = std::exchange(rescan_, false);
+                schedEnabled = whitePointScheduleEnabled_;
+                schedStartMin = whitePointScheduleStartMin_;
+                schedEndMin = whitePointScheduleEndMin_;
+                schedEvalImmediate = std::exchange(whitePointScheduleEvalImmediate_, false);
+                batch.swap(pending_);
+                contrastBatch.swap(pendingContrast_);
+                powerBatch.swap(pendingPower_);
+                vcpBatch.swap(pendingVcp_);
+                whitePointBatch.swap(pendingWhitePoint_);
+                // Never read back while writes are still queued: the value in
+                // flight has not reached the panel yet, so reading now would
+                // yank the slider backwards under the user's finger. refresh_
+                // stays set and we come back to it once the queue drains.
+                doRefresh = batch.empty() && contrastBatch.empty() &&
+                            powerBatch.empty() && vcpBatch.empty() &&
+                            whitePointBatch.empty() && refresh_;
+                if (doRefresh) {
+                    refresh_ = false;
+                }
+            }
+
+            if (doRescan) {
+                Rescan();
+                NotifyChanged(true);
+                if (LoadCapabilities()) {
+                    NotifyChanged(true);
+                }
+            }
+
+            // Each write blocks for tens of ms. Anything the UI posts while
+            // we are on the wire lands in pending_ and overwrites its
+            // predecessor, so we always resume with the newest value.
+            bool wroteDdc = false;
+            // Power first, so a display being switched back on is on before
+            // anything else is written to it.
+            for (const auto& entry : powerBatch) {
+                if (ApplyPower(entry.first, entry.second)) {
+                    wroteDdc = true;
+                }
+            }
+            for (const auto& entry : batch) {
+                if (Apply(entry.first, entry.second) == Transport::DdcCi) {
+                    wroteDdc = true;
+                }
+            }
+            for (const auto& entry : contrastBatch) {
+                if (ApplyContrast(entry.first, entry.second)) {
+                    wroteDdc = true;
+                }
+            }
+            for (const auto& entry : vcpBatch) {
+                if (ApplyVcp(entry.first.first, entry.first.second, entry.second)) {
+                    wroteDdc = true;
+                }
+            }
+            for (const auto& entry : whitePointBatch) {
+                if (ApplyWhitePoint(entry.first, entry.second)) {
+                    wroteDdc = true;
+                }
+            }
+
+            if (schedEnabled) {
+                if (EvaluateWhitePointSchedule(schedStartMin, schedEndMin,
+                                               schedEvalImmediate)) {
+                    wroteDdc = true;
+                }
+            }
+
+            // Breathing room after an I2C write, and it is not politeness.
+            //
+            // A DDC/CI transaction serialises against the display driver, and
+            // while one is on the wire the shell's UI thread stalls. Writing
+            // back-to-back for the whole of a slider drag -- which is what
+            // coalescing alone will happily do, one write every ~60 ms --
+            // starves the slider of pointer input, so the thumb falls behind
+            // the cursor and stops short. Drag quickly to the right-hand end
+            // and you land somewhere in the sixties, which reads as the value
+            // "drifting" on its own.
+            //
+            // So cap the write rate and let the queue coalesce in the gap. The
+            // newest value always wins, so the value the user let go of is
+            // still the one that lands, just up to kDdcCooldown later.
+            if (wroteDdc) {
+                std::unique_lock<std::mutex> lock(mutex_);
+                work_.wait_for(lock, kDdcCooldown, [this] { return quit_; });
+            }
+
+            if (doRefresh) {
+                RefreshValues();
+                // Ensure Magnification stays applied if DWM/UAC/display sleep reset it.
+                if (magInitialized_ && !magActiveDisplays_.empty()) {
+                    double scale = 0.30;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        scale = static_cast<double>(
+                                    std::clamp(100 - whitePointReducePercent_, 1, 95)) /
+                                100.0;
+                    }
+                    UpdateMagnificationWhitePoint(scale, true);
+                }
+                NotifyChanged(false);
+
+                // Opening the panel is the moment a missing slider is
+                // noticed, and it is also the only regular event this engine
+                // gets -- nothing polls. So that is where an expired DDC/CI
+                // verdict is retried, and only if one has actually expired,
+                // which is a map lookup per display in the common case.
+                if (AnyDdcRetryDue()) {
+                    Rescan();
+                    NotifyChanged(true);
+                }
+            }
+        }
+
+        RestoreAllWhitePoint();
+        ReleasePhysicalMonitors();
+
+        // Tear down the WMI interfaces on the thread that created them, while
+        // the apartment is still alive.
+        wmi_.reset();
+
+        if (SUCCEEDED(comHr)) {
+            CoUninitialize();
+        }
+    }
+
+    void NotifyChanged(bool structural) {
+        std::function<void(bool)> fn;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            fn = onChanged_;
+        }
+        if (!fn) {
+            return;
+        }
+        try {
+            fn(structural);
+        } catch (...) {
+            // Must never escape: this runs on a worker thread, and an
+            // unhandled exception there is std::terminate -> the host aborts.
+            Log(L"change callback threw; ignored");
+        }
+    }
+
+    // Re-reads the level each display actually reports. Unlike Rescan this
+    // keeps the existing DDC handles and display list, so it costs one I2C
+    // round trip per external monitor and nothing structural changes.
+    void RefreshValues() {
+        struct Target {
+            std::wstring id;
+            Transport transport;
+            HANDLE hPhysical;
+            std::wstring wmiKey;
+            bool hasContrast;
+            bool hasPower;
+            bool hasVolume;
+            std::vector<int> inputs;
+        };
+
+        std::vector<Target> targets;
+        bool needWmi = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& d : displays_) {
+                targets.push_back({d.stableId, d.transport, d.hPhysical,
+                                   detail::ToLower(d.stableId),
+                                   d.contrastMax > 0, d.hasPower,
+                                   d.volumeMax > 0, d.inputs});
+                if (d.transport == Transport::Wmi) {
+                    needWmi = true;
+                }
+            }
+        }
+
+        std::map<std::wstring, WmiFacts> facts;
+        if (needWmi) {
+            facts = CollectWmiFacts();
+        }
+
+        std::vector<std::pair<std::wstring, int>> updates;
+        std::vector<std::pair<std::wstring, int>> contrastUpdates;
+        std::vector<std::pair<std::wstring, bool>> powerUpdates;
+        std::vector<std::pair<std::wstring, int>> volumeUpdates;
+        std::vector<std::pair<std::wstring, int>> inputUpdates;
+        for (const Target& target : targets) {
+            int percent = -1;
+            switch (target.transport) {
+                case Transport::DdcCi: {
+                    MC_VCP_CODE_TYPE type{};
+                    DWORD current = 0, maximum = 0;
+                    if (GetVCPFeatureAndVCPFeatureReply(target.hPhysical,
+                                                        kVcpLuminance, &type,
+                                                        &current, &maximum) &&
+                        maximum > 0) {
+                        percent = static_cast<int>((current * 100 + maximum / 2) /
+                                                   maximum);
+                    }
+                    if (target.hasContrast) {
+                        current = maximum = 0;
+                        if (GetVCPFeatureAndVCPFeatureReply(
+                                target.hPhysical, kVcpContrast, &type, &current,
+                                &maximum) &&
+                            maximum > 0) {
+                            contrastUpdates.emplace_back(
+                                target.id,
+                                static_cast<int>((current * 100 + maximum / 2) /
+                                                 maximum));
+                        }
+                    }
+                    if (target.hasPower) {
+                        current = maximum = 0;
+                        if (GetVCPFeatureAndVCPFeatureReply(
+                                target.hPhysical, kVcpPower, &type, &current,
+                                &maximum) &&
+                            current >= 1 && current <= 5) {
+                            powerUpdates.emplace_back(target.id, current >= 4);
+                        }
+                    }
+                    if (target.hasVolume) {
+                        current = maximum = 0;
+                        if (GetVCPFeatureAndVCPFeatureReply(target.hPhysical, kVcpVolume,
+                                                            &type, &current, &maximum) &&
+                            maximum > 0) {
+                            volumeUpdates.emplace_back(
+                                target.id,
+                                static_cast<int>((current * 100 + maximum / 2) / maximum));
+                        }
+                    }
+                    if (!target.inputs.empty()) {
+                        current = maximum = 0;
+                        // A value outside the monitor's own list (the Samsung
+                        // G32 answers 5) is not an input; keep what was set.
+                        if (GetVCPFeatureAndVCPFeatureReply(target.hPhysical, kVcpInput,
+                                                            &type, &current, &maximum) &&
+                            std::find(target.inputs.begin(), target.inputs.end(),
+                                      static_cast<int>(current)) != target.inputs.end()) {
+                            inputUpdates.emplace_back(target.id, static_cast<int>(current));
+                        }
+                    }
+                    break;
+                }
+                case Transport::Wmi: {
+                    auto it = facts.find(target.wmiKey);
+                    if (it != facts.end()) {
+                        percent = it->second.currentPercent;
+                    }
+                    break;
+                }
+                case Transport::None:
+                    break;
+            }
+            if (percent >= 0) {
+                updates.emplace_back(target.id, percent);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& update : updates) {
+                for (auto& d : displays_) {
+                    if (d.stableId == update.first) {
+                        d.percent = update.second;
+                        break;
+                    }
+                }
+            }
+            for (const auto& update : contrastUpdates) {
+                for (auto& d : displays_) {
+                    if (d.stableId == update.first) {
+                        d.contrast = update.second;
+                        break;
+                    }
+                }
+            }
+            for (const auto& update : powerUpdates) {
+                if (Display* d = FindLocked(update.first)) {
+                    d->poweredOff = update.second;
+                }
+            }
+            for (const auto& update : volumeUpdates) {
+                if (Display* d = FindLocked(update.first)) {
+                    d->volume = update.second;
+                }
+            }
+            for (const auto& update : inputUpdates) {
+                if (Display* d = FindLocked(update.first)) {
+                    d->input = update.second;
+                }
+            }
+        }
+
+        Log(L"refreshed %zu display value(s)", updates.size());
+    }
+
+    // Windows raises WmiMonitorBrightnessEvent whenever the internal panel's
+    // brightness changes -- function keys, power policy, anything. This is how
+    // the stock slider stays live, and it beats polling. External monitors have
+    // no counterpart: DDC/CI cannot report anything the host did not ask for.
+    void EventThreadMain() {
+        HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+        {
+            WmiSession session;
+            session.SetStopFlag(&stopping_);
+            if (!session.Init() || !session.Services()) {
+                Log(L"brightness events: no WMI connection");
+            } else {
+                IEnumWbemClassObject* events = nullptr;
+                HRESULT hr = session.Services()->ExecNotificationQuery(
+                    _bstr_t(L"WQL"),
+                    _bstr_t(L"SELECT * FROM WmiMonitorBrightnessEvent"),
+                    WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                    nullptr, &events);
+
+                if (FAILED(hr) || !events) {
+                    Log(L"brightness events unavailable: %08X",
+                        static_cast<unsigned>(hr));
+                } else {
+                    Log(L"listening for brightness events");
+                    for (;;) {
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            if (quit_) {
+                                break;
+                            }
+                        }
+
+                        IWbemClassObject* obj = nullptr;
+                        ULONG got = 0;
+                        // Short timeout so Stop() is not kept waiting.
+                        HRESULT next = events->Next(500, 1, &obj, &got);
+                        // Failure first. Any hard failure -- WMI restarting,
+                        // WBEM_E_TRANSPORT_FAILURE, WBEM_E_CALL_CANCELLED --
+                        // also comes back with got == 0, so testing the
+                        // timeout case first would swallow it and spin on a
+                        // permanently failing Next, burning a core inside the
+                        // shell until the mod is disabled.
+                        if (FAILED(next)) {
+                            Log(L"brightness events: Next failed %08X; "
+                                L"stopping the listener",
+                                static_cast<unsigned>(next));
+                            break;
+                        }
+                        if (next == WBEM_S_TIMEDOUT || got != 1 || !obj) {
+                            continue;
+                        }
+
+                        std::wstring instance =
+                            detail::GetStrProp(obj, L"InstanceName");
+                        int level = detail::GetIntProp(obj, L"Brightness");
+                        obj->Release();
+
+                        if (!instance.empty() && level >= 0) {
+                            OnBrightnessEvent(instance, level);
+                        }
+                    }
+                    events->Release();
+                }
+            }
+        }  // session released here, inside its own apartment
+
+        if (SUCCEEDED(comHr)) {
+            CoUninitialize();
+        }
+    }
+
+    void OnBrightnessEvent(const std::wstring& instanceName, int percent) {
+        std::wstring key = instanceName;
+        if (key.size() > 2 && key.compare(key.size() - 2, 2, L"_0") == 0) {
+            key.erase(key.size() - 2);
+        }
+        key = detail::ToLower(key);
+
+        std::wstring changedId;
+        std::vector<std::pair<std::wstring, int>> follow;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            Display* target = nullptr;
+            for (auto& d : displays_) {
+                if (detail::ToLower(d.stableId) == key) {
+                    target = &d;
+                    break;
+                }
+            }
+            if (!target || target->percent == percent) {
+                return;
+            }
+
+            // Our own writes raise this event too, and matching on the value
+            // is not enough: coalescing means the event for a value we wrote
+            // can arrive after we have already written a newer one, so the
+            // values disagree and the echo looks like an external change.
+            // Following would then compute a delta against the wrong baseline
+            // and shove the other monitors around at random.
+            //
+            // So the test is per display and purely temporal. This does not
+            // swallow the keypresses we want to follow: those change the
+            // internal panel, which we never write to in response -- following
+            // only ever writes to the *other* displays.
+            auto requested = lastRequest_.find(target->stableId);
+            if (requested != lastRequest_.end() &&
+                std::chrono::steady_clock::now() - requested->second <
+                    std::chrono::milliseconds(1500)) {
+                return;
+            }
+
+            int previous = target->percent;
+            changedId = target->stableId;
+            target->percent = percent;
+
+            if (followMode_ != FollowMode::Off) {
+                int delta = (previous >= 0) ? percent - previous : 0;
+                for (auto& d : displays_) {
+                    if (d.stableId == changedId ||
+                        d.transport == Transport::None) {
+                        continue;
+                    }
+
+                    int want;
+                    if (followMode_ == FollowMode::Match) {
+                        want = percent;
+                        // Nothing to accumulate in match mode, and leaving a
+                        // stale accumulator behind would make a later switch
+                        // back to relative jump.
+                        followRaw_.erase(d.stableId);
+                    } else {
+                        // Clamping the *stored* value destroys the offset this
+                        // mode exists to preserve: panel 50 -> 10 with a
+                        // monitor at 30 stores 0, and panel 10 -> 50 then
+                        // gives 40 rather than 30. Every trip to an end stop
+                        // used to shift that monitor permanently. So the
+                        // accumulator runs unclamped past the ends and only
+                        // what goes to the hardware is clamped.
+                        auto seen = followRaw_.find(d.stableId);
+                        int raw = (seen != followRaw_.end())
+                                      ? seen->second
+                                      : ((d.percent < 0) ? percent : d.percent);
+                        // Bounded so a long run against an end stop cannot
+                        // wander arbitrarily far and take many keypresses to
+                        // come back.
+                        raw = std::clamp(raw + delta, -100, 200);
+                        followRaw_[d.stableId] = raw;
+                        want = std::clamp(raw, 0, 100);
+                    }
+
+                    if (want != d.percent) {
+                        follow.emplace_back(d.stableId, want);
+                    }
+                }
+            }
+        }
+
+        Log(L"brightness event: %ls is now %d%%", instanceName.c_str(), percent);
+
+        // Outside the lock: SetPercentInternal takes it. Not the public
+        // SetPercent -- that re-bases following, which would erase the
+        // accumulator computed just above.
+        for (const auto& entry : follow) {
+            SetPercentInternal(entry.first, entry.second,
+                               /*rebaseFollow=*/false);
+        }
+
+        NotifyChanged(false);
+    }
+
+    void ReleasePhysicalMonitors() {
+        // The handles come out under the lock; the destroying happens without
+        // it. This is the same mutex the XAML thread takes in GetDisplays()
+        // and in SetPercent() from the slider's ValueChanged, so holding it
+        // across DestroyPhysicalMonitors let a slow monitor teardown during a
+        // rescan stall the shell's UI thread.
+        std::vector<HANDLE> handles;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& d : displays_) {
+                if (d.hPhysical) {
+                    handles.push_back(d.hPhysical);
+                    d.hPhysical = nullptr;
+                }
+            }
+        }
+        for (HANDLE h : handles) {
+            PHYSICAL_MONITOR pm{};
+            pm.hPhysicalMonitor = h;
+            DestroyPhysicalMonitors(1, &pm);
+        }
+    }
+
+    struct WmiFacts {
+        std::wstring name;
+        std::wstring methodsPath;
+        int currentPercent = -1;
+        bool hasBrightnessMethods = false;
+    };
+
+    std::map<std::wstring, WmiFacts> CollectWmiFacts() {
+        std::map<std::wstring, WmiFacts> facts;
+        if (!wmi_) {
+            return facts;
+        }
+
+        auto key = [](std::wstring instanceName) {
+            // "DISPLAY\BOE0AAE\4&..._0" -> "display\boe0aae\4&..."
+            if (instanceName.size() > 2 &&
+                instanceName.compare(instanceName.size() - 2, 2, L"_0") == 0) {
+                instanceName.erase(instanceName.size() - 2);
+            }
+            return detail::ToLower(instanceName);
+        };
+
+        wmi_->ForEach(L"SELECT * FROM WmiMonitorID", [&](IWbemClassObject* o) {
+            std::wstring inst = detail::GetStrProp(o, L"InstanceName");
+            if (!inst.empty()) {
+                facts[key(inst)].name =
+                    detail::GetU16ArrayProp(o, L"UserFriendlyName");
+            }
+        });
+
+        wmi_->ForEach(L"SELECT * FROM WmiMonitorBrightness",
+                     [&](IWbemClassObject* o) {
+                         std::wstring inst =
+                             detail::GetStrProp(o, L"InstanceName");
+                         if (!inst.empty()) {
+                             facts[key(inst)].currentPercent =
+                                 detail::GetIntProp(o, L"CurrentBrightness");
+                         }
+                     });
+
+        wmi_->ForEach(L"SELECT * FROM WmiMonitorBrightnessMethods",
+                     [&](IWbemClassObject* o) {
+                         std::wstring inst =
+                             detail::GetStrProp(o, L"InstanceName");
+                         if (!inst.empty()) {
+                             WmiFacts& f = facts[key(inst)];
+                             f.hasBrightnessMethods = true;
+                             f.methodsPath = detail::GetStrProp(o, L"__RELPATH");
+                         }
+                     });
+
+        return facts;
+    }
+
+    static BOOL CALLBACK EnumProc(HMONITOR h, HDC, LPRECT, LPARAM data) {
+        reinterpret_cast<std::vector<HMONITOR>*>(data)->push_back(h);
+        return TRUE;
+    }
+
+    // How long to leave a failed DDC/CI probe alone: 30s, then a minute, then
+    // doubling to a 16-minute ceiling. Short enough that a monitor which was
+    // merely asleep comes back on its own; long enough that a monitor which
+    // genuinely has no DDC/CI is not costing seconds per rescan.
+    static std::chrono::steady_clock::duration DdcRetryDelay(int failures) {
+        int shift = failures - 1;
+        if (shift < 0) {
+            shift = 0;
+        } else if (shift > 5) {
+            shift = 5;
+        }
+        return std::chrono::seconds(30) * (1 << shift);
+    }
+
+    // Whether any display currently written off as uncontrollable is due
+    // another probe. Worker thread.
+    bool AnyDdcRetryDue() {
+        const std::chrono::steady_clock::time_point now =
+            std::chrono::steady_clock::now();
+        std::vector<Display> snapshot;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshot = displays_;
+        }
+        for (const Display& d : snapshot) {
+            if (d.transport != Transport::None) {
+                continue;
+            }
+            std::map<std::wstring, DdcVerdict>::const_iterator known =
+                ddcAnswered_.find(d.stableId);
+            if (known != ddcAnswered_.end() && !known->second.answered &&
+                (now - known->second.taken) >=
+                    DdcRetryDelay(known->second.failures)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void Rescan() {
+        ReleasePhysicalMonitors();
+
+        std::vector<HMONITOR> handles;
+        EnumDisplayMonitors(nullptr, nullptr, &Engine::EnumProc,
+                            reinterpret_cast<LPARAM>(&handles));
+
+        std::map<std::wstring, WmiFacts> facts = CollectWmiFacts();
+        std::vector<Display> found;
+
+        for (HMONITOR h : handles) {
+            // Probing a monitor that does not answer DDC/CI can take seconds,
+            // and the loop is otherwise uninterruptible, so an unload landing
+            // mid-rescan would wait for all of them.
+            if (stopping_.load()) {
+                break;
+            }
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            if (!GetMonitorInfoW(h, &mi)) {
+                continue;
+            }
+
+            Display d;
+            d.gdiDeviceName = mi.szDevice;
+            d.rect = mi.rcMonitor;
+            d.isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;  // @harness-only
+
+            DISPLAY_DEVICEW dd{};
+            dd.cb = sizeof(dd);
+            if (EnumDisplayDevicesW(mi.szDevice, 0, &dd,
+                                    EDD_GET_DEVICE_INTERFACE_NAME)) {
+                d.stableId = detail::DeviceInterfaceToInstanceId(dd.DeviceID);
+            }
+            if (d.stableId.empty()) {
+                d.stableId = mi.szDevice;  // last resort, not hotplug-stable
+            }
+
+            DISPLAY_DEVICEW ddName{};
+            ddName.cb = sizeof(ddName);
+            std::wstring gdiName;
+            if (EnumDisplayDevicesW(mi.szDevice, 0, &ddName, 0)) {
+                gdiName = ddName.DeviceString;
+            }
+
+            std::map<std::wstring, WmiFacts>::const_iterator it =
+                facts.find(detail::ToLower(d.stableId));
+            const WmiFacts* f = (it != facts.end()) ? &it->second : nullptr;
+
+            if (f && !f->name.empty()) {
+                d.name = f->name;
+            }
+
+            // DDC/CI first: it is the only option for external panels, and on
+            // a laptop it fails fast (ERROR_GEN_FAILURE) for the internal one.
+            // Probing DDC/CI is not free: a monitor or dock that does not
+            // answer can take seconds to fail, and that cost is paid again on
+            // every rescan -- every hotplug, every WM_DISPLAYCHANGE. So a
+            // failure is remembered per EDID id.
+            //
+            // Remembered, not final. "Did not answer" is not always a property
+            // of the monitor: one asleep at sign-in, behind a dock or KVM that
+            // is still enumerating, or switched to another input all fail the
+            // first probe and would then be written off as uncontrollable for
+            // the rest of the session -- no slider, and no way to get one back
+            // short of reloading the mod. So a failed verdict expires, on a
+            // delay that doubles each time, and a display that goes away drops
+            // its verdict entirely (below) so a replug starts over.
+            std::map<std::wstring, DdcVerdict>::const_iterator known =
+                ddcAnswered_.find(d.stableId);
+            const std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now();
+            bool probe = true;
+            if (known != ddcAnswered_.end() && !known->second.answered) {
+                probe = (now - known->second.taken) >=
+                        DdcRetryDelay(known->second.failures);
+            }
+            bool attached = false;
+            if (probe) {
+                attached = TryAttachDdcCi(h, &d);
+                DdcVerdict& v = ddcAnswered_[d.stableId];
+                v.failures = attached ? 0 : v.failures + 1;
+                v.answered = attached;
+                v.taken = now;
+            }
+
+            if (attached) {
+                if (d.name.empty()) {
+                    d.name = gdiName.empty() ? L"External display" : gdiName;
+                }
+            } else if (f && f->hasBrightnessMethods) {
+                d.transport = Transport::Wmi;
+                d.wmiPath = f->methodsPath;
+                d.percent = f->currentPercent;
+                if (d.name.empty()) {
+                    d.name = L"Built-in display";
+                }
+            } else {
+                d.transport = Transport::None;
+                if (d.name.empty()) {
+                    d.name = gdiName.empty() ? L"Display" : gdiName;
+                }
+            }
+
+            found.push_back(std::move(d));
+        }
+
+        // Left-to-right, so slider order matches the physical layout.
+        std::sort(found.begin(), found.end(),
+                  [](const Display& a, const Display& b) {
+                      if (a.rect.left != b.rect.left) {
+                          return a.rect.left < b.rect.left;
+                      }
+                      return a.rect.top < b.rect.top;
+                  });
+
+        // A display that is gone takes its DDC/CI verdict and capabilities
+        // with it, so unplugging and replugging a monitor that failed its
+        // first probe, or its first capabilities read, gets a fresh one
+        // rather than inheriting the old answer.
+        auto dropMissing = [&found](auto& byDisplay) {
+            for (auto it = byDisplay.begin(); it != byDisplay.end();) {
+                bool present = false;
+                for (const Display& d : found) {
+                    if (d.stableId == it->first) {
+                        present = true;
+                        break;
+                    }
+                }
+                it = present ? std::next(it) : byDisplay.erase(it);
+            }
+        };
+        dropMissing(ddcAnswered_);
+        dropMissing(caps_);
+        dropMissing(capsAttempts_);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // Preserve Reduce White Point state across rescans.
+            for (auto& d : found) {
+                d.whitePointReduced = whitePointReducedIds_.count(d.stableId) > 0;
+            }
+            // Drop accumulators for displays that are no longer here, so a
+            // monitor that comes back does not inherit an offset from an
+            // earlier session of itself.
+            for (auto it = followRaw_.begin(); it != followRaw_.end();) {
+                bool present = false;
+                for (const auto& d : found) {
+                    if (d.stableId == it->first) {
+                        present = true;
+                        break;
+                    }
+                }
+                it = present ? std::next(it) : followRaw_.erase(it);
+            }
+
+            displays_ = std::move(found);
+        }
+
+        // Magnification caches the monitor topology at MagInitialize() time.
+        // When a display is hotplugged (e.g. opening a laptop lid), re-init
+        // Magnification and re-apply the effect so the new display is covered.
+        if (magInitialized_ && !magActiveDisplays_.empty()) {
+            double scale = 0.30;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                scale = static_cast<double>(
+                            std::clamp(100 - whitePointReducePercent_, 1, 95)) /
+                        100.0;
+            }
+            UpdateMagnificationWhitePoint(1.0, false);
+            UpdateMagnificationWhitePoint(scale, true);
+        }
+    }
+
+    // Deliberately does NOT call GetMonitorCapabilities: plenty of monitors
+    // (the Samsung G32 among them) fail it with 0xC0262C07 while answering raw
+    // VCP reads and writes perfectly well.
+    bool TryAttachDdcCi(HMONITOR h, Display* d) {
+        DWORD count = 0;
+        if (!GetNumberOfPhysicalMonitorsFromHMONITOR(h, &count) || count == 0) {
+            return false;
+        }
+
+        std::vector<PHYSICAL_MONITOR> physical(count);
+        if (!GetPhysicalMonitorsFromHMONITOR(h, count, physical.data())) {
+            return false;
+        }
+
+        // A single HMONITOR maps to more than one physical monitor only in
+        // clone/daisy-chain setups; the first one that answers wins.
+        bool attached = false;
+        for (DWORD i = 0; i < count; ++i) {
+            MC_VCP_CODE_TYPE type{};
+            DWORD current = 0, maximum = 0;
+            if (!attached &&
+                GetVCPFeatureAndVCPFeatureReply(physical[i].hPhysicalMonitor,
+                                                kVcpLuminance, &type, &current,
+                                                &maximum) &&
+                maximum > 0) {
+                d->transport = Transport::DdcCi;
+                d->hPhysical = physical[i].hPhysicalMonitor;
+                d->vcpMax = maximum;
+                d->percent =
+                    static_cast<int>((current * 100 + maximum / 2) / maximum);
+                ProbeExtras(d);
+                attached = true;
+                continue;  // keep this handle alive
+            }
+            DestroyPhysicalMonitors(1, &physical[i]);
+        }
+
+        return attached;
+    }
+
+    // Contrast and power are extras on the handle that answered brightness.
+    // A monitor that does not implement one fails the read (or answers it
+    // with nothing usable), which costs one I2C round trip and leaves that
+    // extra off.
+    void ProbeExtras(Display* d) {
+        MC_VCP_CODE_TYPE type{};
+        DWORD current = 0, maximum = 0;
+        if (GetVCPFeatureAndVCPFeatureReply(d->hPhysical, kVcpContrast, &type,
+                                            &current, &maximum) &&
+            maximum > 0) {
+            d->contrastMax = maximum;
+            d->contrast =
+                static_cast<int>((current * 100 + maximum / 2) / maximum);
+        }
+        // 1 on, 2 standby, 3 suspend, 4 off, 5 off by the power button. A
+        // monitor that answers 0 -- the Samsung G32 does -- has no power
+        // control to offer, however willingly it answers the read.
+        current = maximum = 0;
+        if (GetVCPFeatureAndVCPFeatureReply(d->hPhysical, kVcpPower, &type,
+                                            &current, &maximum) &&
+            current >= 1 && current <= 5) {
+            d->hasPower = true;
+            d->poweredOff = current >= 4;
+        }
+        current = maximum = 0;
+        if (GetVCPFeatureAndVCPFeatureReply(d->hPhysical, kVcpVolume, &type, &current,
+                                            &maximum) &&
+            maximum > 0) {
+            d->volumeMax = maximum;
+            d->volume = static_cast<int>((current * 100 + maximum / 2) / maximum);
+        }
+        // Capabilities already read this session carry over to a rescan.
+        auto caps = caps_.find(d->stableId);
+        if (caps != caps_.end() && caps->second.loaded) {
+            ApplyCapabilities(*d, caps->second);
+        }
+    }
+
+    // The DDC/CI handle of a display, or null. Worker thread.
+    HANDLE DdcHandleFor(const std::wstring& stableId) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Display* d = FindLocked(stableId);
+        return d && d->transport == Transport::DdcCi ? d->hPhysical : nullptr;
+    }
+
+    // One field of a display, read under the lock; fallback if it is gone.
+    template <typename T>
+    T DisplayField(const std::wstring& stableId, T Display::*field, T fallback) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const Display* d = FindLocked(stableId);
+        return d ? d->*field : fallback;
+    }
+
+    // Returns whether anything went on the wire, for the DDC/CI cooldown.
+    bool ApplyContrast(const std::wstring& stableId, int percent) {
+        HANDLE hPhysical = DdcHandleFor(stableId);
+        const DWORD contrastMax = DisplayField<DWORD>(stableId, &Display::contrastMax, 0);
+        if (!hPhysical || contrastMax == 0) {
+            return false;
+        }
+        std::chrono::steady_clock::time_point start =
+            std::chrono::steady_clock::now();
+        DWORD raw = static_cast<DWORD>(
+            (static_cast<DWORD>(percent) * contrastMax + 50) / 100);
+        bool ok = SetVCPFeature(hPhysical, kVcpContrast, raw) != FALSE;
+        long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        Log(L"contrast %ls -> %d%% ok=%d (%lld ms)", stableId.c_str(), percent,
+            ok ? 1 : 0, ms);
+        return true;
+    }
+
+    bool ApplyVcp(const std::wstring& stableId, BYTE code, DWORD raw) {
+        HANDLE hPhysical = DdcHandleFor(stableId);
+        if (!hPhysical) {
+            return false;
+        }
+        bool ok = SetVCPFeature(hPhysical, code, raw) != FALSE;
+        Log(L"vcp %02X %ls -> %lu ok=%d", code, stableId.c_str(), raw, ok ? 1 : 0);
+        return true;
+    }
+
+    static constexpr wchar_t kWhitePointParentRegPath[] =
+        L"Software\\Windhawk\\PerMonitorBrightness";
+    static constexpr wchar_t kWhitePointRegPath[] =
+        L"Software\\Windhawk\\PerMonitorBrightness\\WhitePoint";
+
+    static int CurrentLocalMinutes() {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        return static_cast<int>(st.wHour) * 60 + static_cast<int>(st.wMinute);
+    }
+
+    static bool IsInWhitePointSchedule(int nowMin, int startMin, int endMin) {
+        if (startMin == endMin) {
+            return false;
+        }
+        if (startMin < endMin) {
+            return nowMin >= startMin && nowMin < endMin;
+        }
+        return nowMin >= startMin || nowMin < endMin;
+    }
+
+    static std::optional<bool> LoadScheduleLastInWindow() {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kWhitePointParentRegPath, 0,
+                          KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+            return std::nullopt;
+        }
+        DWORD val = 0;
+        DWORD size = sizeof(val);
+        DWORD type = 0;
+        LONG r = RegQueryValueExW(key, L"ScheduleLastInWindow", nullptr, &type,
+                                  reinterpret_cast<BYTE*>(&val), &size);
+        RegCloseKey(key);
+        if (r == ERROR_SUCCESS && type == REG_DWORD) {
+            return val != 0;
+        }
+        return std::nullopt;
+    }
+
+    static void SaveScheduleLastInWindow(bool inWindow) {
+        HKEY key = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, kWhitePointParentRegPath, 0,
+                            nullptr, 0, KEY_SET_VALUE, nullptr, &key,
+                            nullptr) != ERROR_SUCCESS) {
+            return;
+        }
+        DWORD val = inWindow ? 1 : 0;
+        RegSetValueExW(key, L"ScheduleLastInWindow", 0, REG_DWORD,
+                       reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        RegCloseKey(key);
+    }
+
+    bool EvaluateWhitePointSchedule(int startMin, int endMin, bool immediate) {
+        if (!whitePointScheduleLastInWindow_.has_value()) {
+            whitePointScheduleLastInWindow_ = LoadScheduleLastInWindow();
+        }
+        bool inWindow = IsInWhitePointSchedule(CurrentLocalMinutes(), startMin, endMin);
+        if (!immediate && whitePointScheduleLastInWindow_.has_value() &&
+            *whitePointScheduleLastInWindow_ == inWindow) {
+            return false;
+        }
+        whitePointScheduleLastInWindow_ = inWindow;
+        SaveScheduleLastInWindow(inWindow);
+
+        std::vector<std::wstring> targetIds;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& d : displays_) {
+                if (d.whitePointReduced != inWindow) {
+                    d.whitePointReduced = inWindow;
+                    if (inWindow) {
+                        whitePointReducedIds_.insert(d.stableId);
+                    } else {
+                        whitePointReducedIds_.erase(d.stableId);
+                    }
+                    SaveWhitePointEntry(d.stableId, inWindow);
+                    targetIds.push_back(d.stableId);
+                }
+            }
+        }
+        if (targetIds.empty()) {
+            return false;
+        }
+        bool wroteDdc = false;
+        for (const auto& id : targetIds) {
+            if (ApplyWhitePoint(id, inWindow)) {
+                wroteDdc = true;
+            }
+        }
+        Log(L"white point schedule %ls (%zu displays)",
+            inWindow ? L"ON" : L"OFF", targetIds.size());
+        NotifyChanged(false);
+        return wroteDdc;
+    }
+
+    static void SaveWhitePointEntry(const std::wstring& stableId, bool reduced) {
+        HKEY key = nullptr;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, kWhitePointRegPath, 0, nullptr,
+                            0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+            return;
+        }
+        if (reduced) {
+            DWORD val = 1;
+            RegSetValueExW(key, stableId.c_str(), 0, REG_DWORD,
+                           reinterpret_cast<const BYTE*>(&val), sizeof(val));
+        } else {
+            RegDeleteValueW(key, stableId.c_str());
+        }
+        RegCloseKey(key);
+    }
+
+    void LoadWhitePointState() {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kWhitePointRegPath, 0,
+                          KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) {
+            return;
+        }
+        std::set<std::wstring> loaded;
+        wchar_t name[512];
+        for (DWORD idx = 0;; ++idx) {
+            DWORD nameLen = ARRAYSIZE(name);
+            DWORD type = 0;
+            DWORD val = 0;
+            DWORD valSize = sizeof(val);
+            LONG r = RegEnumValueW(key, idx, name, &nameLen, nullptr, &type,
+                                   reinterpret_cast<BYTE*>(&val), &valSize);
+            if (r == ERROR_NO_MORE_ITEMS) {
+                break;
+            }
+            if (r == ERROR_SUCCESS && type == REG_DWORD && val != 0 && nameLen > 0) {
+                loaded.emplace(name, nameLen);
+            }
+        }
+        RegCloseKey(key);
+        std::lock_guard<std::mutex> lock(mutex_);
+        whitePointReducedIds_.insert(loaded.begin(), loaded.end());
+    }
+
+    bool ApplyPower(const std::wstring& stableId, bool on) {
+        HANDLE hPhysical = DdcHandleFor(stableId);
+        if (!hPhysical || !DisplayField(stableId, &Display::hasPower, false)) {
+            return false;
+        }
+        bool ok = SetVCPFeature(hPhysical, kVcpPower, on ? kPowerOn : kPowerOff) !=
+                  FALSE;
+        Log(L"power %ls -> %ls ok=%d", stableId.c_str(), on ? L"on" : L"off",
+            ok ? 1 : 0);
+        return true;
+    }
+
+    // Queries Windows DisplayConfig to see whether HDR / Advanced Color is
+    // currently active on the given GDI display device (e.g. "\\.\DISPLAY5").
+    // When HDR is active, DWM manages the 16-bit scRGB pipeline and ignores
+    // legacy GDI SetDeviceGammaRamp calls.
+    static bool IsHdrEnabled(const std::wstring& gdiDeviceName) {
+        if (gdiDeviceName.empty()) {
+            return false;
+        }
+        UINT32 numPaths = 0, numModes = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &numPaths, &numModes) !=
+                ERROR_SUCCESS ||
+            numPaths == 0) {
+            return false;
+        }
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(numPaths);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(numModes);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &numPaths, paths.data(),
+                               &numModes, modes.data(), nullptr) != ERROR_SUCCESS) {
+            return false;
+        }
+        for (UINT32 i = 0; i < numPaths; ++i) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME srcName{};
+            srcName.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            srcName.header.size = sizeof(srcName);
+            srcName.header.adapterId = paths[i].sourceInfo.adapterId;
+            srcName.header.id = paths[i].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&srcName.header) != ERROR_SUCCESS) {
+                continue;
+            }
+            if (_wcsicmp(srcName.viewGdiDeviceName, gdiDeviceName.c_str()) != 0) {
+                continue;
+            }
+            // DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO == 9
+            struct AdvColorInfo {
+                DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+                UINT32 value;
+                UINT32 colorEncoding;
+                INT32 bitsPerColorChannel;
+            } adv{};
+            adv.header.type = static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(9);
+            adv.header.size = sizeof(adv);
+            adv.header.adapterId = paths[i].targetInfo.adapterId;
+            adv.header.id = paths[i].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&adv.header) == ERROR_SUCCESS) {
+                // bit 1 (0x2) is advancedColorEnabled
+                return (adv.value & 0x2u) != 0;
+            }
+        }
+        return false;
+    }
+
+    bool ApplyGammaRampWhitePoint(const std::wstring& stableId,
+                                  const std::wstring& gdiDevice, double scale) {
+        if (gdiDevice.empty()) {
+            return false;
+        }
+        HDC hdc = CreateDCW(nullptr, gdiDevice.c_str(), nullptr, nullptr);
+        if (!hdc) {
+            return false;
+        }
+        auto it = savedGammaRamps_.find(stableId);
+        if (it == savedGammaRamps_.end()) {
+            std::array<WORD, 256 * 3> orig{};
+            if (!GetDeviceGammaRamp(hdc, orig.data())) {
+                DeleteDC(hdc);
+                return false;
+            }
+            it = savedGammaRamps_.emplace(stableId, orig).first;
+        }
+        std::array<WORD, 256 * 3> ramp{};
+        for (size_t i = 0; i < ramp.size(); ++i) {
+            long val = std::lround(static_cast<double>(it->second[i]) * scale);
+            ramp[i] = static_cast<WORD>(std::clamp(val, 0L, 65535L));
+        }
+        bool ok = SetDeviceGammaRamp(hdc, ramp.data()) != FALSE;
+        DeleteDC(hdc);
+        if (!ok && savedGammaRamps_.count(stableId)) {
+            savedGammaRamps_.erase(stableId);
+        }
+        Log(L"whitePoint gamma %ls (%ls) scale=%.2f ok=%d", stableId.c_str(),
+            gdiDevice.c_str(), scale, ok ? 1 : 0);
+        return ok;
+    }
+
+    void RestoreGammaRampWhitePoint(const std::wstring& stableId,
+                                    const std::wstring& gdiDevice) {
+        auto it = savedGammaRamps_.find(stableId);
+        if (it == savedGammaRamps_.end()) {
+            return;
+        }
+        if (!gdiDevice.empty()) {
+            if (HDC hdc = CreateDCW(nullptr, gdiDevice.c_str(), nullptr, nullptr)) {
+                SetDeviceGammaRamp(hdc, it->second.data());
+                DeleteDC(hdc);
+            }
+        }
+        savedGammaRamps_.erase(it);
+    }
+
+    bool ApplyDdcRgbGainWhitePoint(const std::wstring& stableId, HANDLE hPhysical,
+                                   double scale) {
+        if (!hPhysical) {
+            return false;
+        }
+        auto it = savedRgbGain_.find(stableId);
+        if (it == savedRgbGain_.end()) {
+            MC_VCP_CODE_TYPE type{};
+            RgbGainState base{};
+            if (!GetVCPFeatureAndVCPFeatureReply(hPhysical, kVcpRedGain, &type,
+                                                 &base.rCur, &base.rMax) ||
+                !GetVCPFeatureAndVCPFeatureReply(hPhysical, kVcpGreenGain, &type,
+                                                 &base.gCur, &base.gMax) ||
+                !GetVCPFeatureAndVCPFeatureReply(hPhysical, kVcpBlueGain, &type,
+                                                 &base.bCur, &base.bMax) ||
+                base.rMax == 0 || base.gMax == 0 || base.bMax == 0) {
+                return false;
+            }
+            it = savedRgbGain_.emplace(stableId, base).first;
+        }
+        const RgbGainState& base = it->second;
+        DWORD r = static_cast<DWORD>(std::lround(base.rCur * scale));
+        DWORD g = static_cast<DWORD>(std::lround(base.gCur * scale));
+        DWORD b = static_cast<DWORD>(std::lround(base.bCur * scale));
+        bool ok = SetVCPFeature(hPhysical, kVcpRedGain, r) &&
+                  SetVCPFeature(hPhysical, kVcpGreenGain, g) &&
+                  SetVCPFeature(hPhysical, kVcpBlueGain, b);
+        if (ok && r != base.rCur) {
+            // Some monitors (e.g. in HDR mode) return TRUE for SetVCPFeature
+            // while ignoring the write. Read back Red gain to verify it took.
+            MC_VCP_CODE_TYPE type{};
+            DWORD rb = 0, rbMax = 0;
+            if (!GetVCPFeatureAndVCPFeatureReply(hPhysical, kVcpRedGain, &type, &rb, &rbMax) ||
+                rb == base.rCur) {
+                ok = false;
+            }
+        }
+        Log(L"whitePoint ddcRgb %ls -> (%lu,%lu,%lu) ok=%d", stableId.c_str(),
+            r, g, b, ok ? 1 : 0);
+        if (!ok) {
+            RestoreDdcRgbGainWhitePoint(stableId, hPhysical);
+        }
+        return ok;
+    }
+
+    bool RestoreDdcRgbGainWhitePoint(const std::wstring& stableId, HANDLE hPhysical) {
+        auto it = savedRgbGain_.find(stableId);
+        if (it == savedRgbGain_.end()) {
+            return false;
+        }
+        const RgbGainState base = it->second;
+        savedRgbGain_.erase(it);
+        if (!hPhysical) {
+            return false;
+        }
+        SetVCPFeature(hPhysical, kVcpRedGain, base.rCur);
+        SetVCPFeature(hPhysical, kVcpGreenGain, base.gCur);
+        SetVCPFeature(hPhysical, kVcpBlueGain, base.bCur);
+        return true;
+    }
+
+    bool UpdateMagnificationWhitePoint(double scale, bool active) {
+        struct MagColorEffect {
+            float transform[5][5];
+        };
+        using MagInitFn = BOOL(WINAPI*)();
+        using MagUninitFn = BOOL(WINAPI*)();
+        using MagSetFxFn = BOOL(WINAPI*)(MagColorEffect*);
+
+        if (!magModule_) {
+            if (!active) {
+                return true;
+            }
+            magModule_ = LoadLibraryW(L"Magnification.dll");
+            if (!magModule_) {
+                Log(L"whitePoint magnification: LoadLibrary failed (%u)",
+                    GetLastError());
+                return false;
+            }
+        }
+        auto magInit = reinterpret_cast<MagInitFn>(
+            GetProcAddress(magModule_, "MagInitialize"));
+        auto magUninit = reinterpret_cast<MagUninitFn>(
+            GetProcAddress(magModule_, "MagUninitialize"));
+        auto magSetFx = reinterpret_cast<MagSetFxFn>(
+            GetProcAddress(magModule_, "MagSetFullscreenColorEffect"));
+        if (!magInit || !magUninit || !magSetFx) {
+            return false;
+        }
+        if (active) {
+            if (!magInitialized_) {
+                magInitialized_ = (magInit() != FALSE);
+                if (!magInitialized_) {
+                    Log(L"whitePoint MagInitialize failed (%u)", GetLastError());
+                    return false;
+                }
+            }
+            const float s = static_cast<float>(scale);
+            MagColorEffect fx{};
+            fx.transform[0][0] = s;
+            fx.transform[1][1] = s;
+            fx.transform[2][2] = s;
+            fx.transform[3][3] = 1.0f;
+            fx.transform[4][4] = 1.0f;
+            bool ok = magSetFx(&fx) != FALSE;
+            Log(L"whitePoint magnification scale=%.2f ok=%d", scale, ok ? 1 : 0);
+            return ok;
+        } else {
+            if (magInitialized_) {
+                MagColorEffect identity{};
+                identity.transform[0][0] = 1.0f;
+                identity.transform[1][1] = 1.0f;
+                identity.transform[2][2] = 1.0f;
+                identity.transform[3][3] = 1.0f;
+                identity.transform[4][4] = 1.0f;
+                magSetFx(&identity);
+                magUninit();
+                magInitialized_ = false;
+            }
+            return true;
+        }
+    }
+
+    // Returns whether a DDC/CI write occurred (for kDdcCooldown).
+    bool ApplyWhitePoint(const std::wstring& stableId, bool reduce) {
+        Transport transport = Transport::None;
+        HANDLE hPhysical = nullptr;
+        std::wstring gdiDevice;
+        int reducePercent = 70;
+        WhitePointMethod method = WhitePointMethod::Auto;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            reducePercent = whitePointReducePercent_;
+            method = whitePointMethod_;
+            if (const Display* d = FindLocked(stableId)) {
+                transport = d->transport;
+                hPhysical = d->hPhysical;
+                gdiDevice = d->gdiDeviceName;
+            }
+        }
+        if (!reduce) {
+            bool wroteDdc = RestoreDdcRgbGainWhitePoint(stableId, hPhysical);
+            RestoreGammaRampWhitePoint(stableId, gdiDevice);
+            magActiveDisplays_.erase(stableId);
+            if (magActiveDisplays_.empty() && magInitialized_) {
+                UpdateMagnificationWhitePoint(1.0, false);
+            }
+            return wroteDdc;
+        }
+
+        const double scale =
+            static_cast<double>(std::clamp(100 - reducePercent, 1, 95)) / 100.0;
+        const bool hdr = IsHdrEnabled(gdiDevice);
+        bool wroteDdc = false;
+        bool applied = false;
+
+        if (method == WhitePointMethod::DdcRgbGain ||
+            (method == WhitePointMethod::Auto && !hdr &&
+             transport == Transport::DdcCi)) {
+            if (ApplyDdcRgbGainWhitePoint(stableId, hPhysical, scale)) {
+                wroteDdc = true;
+                applied = true;
+            }
+        }
+        if (!applied && !hdr &&
+            (method == WhitePointMethod::GammaRamp ||
+             method == WhitePointMethod::Auto)) {
+            if (ApplyGammaRampWhitePoint(stableId, gdiDevice, scale)) {
+                applied = true;
+            } else if (method == WhitePointMethod::GammaRamp && scale < 0.50) {
+                // Windows win32k rejects SetDeviceGammaRamp below ~50%; clamp
+                // when GammaRamp is explicitly selected.
+                applied = ApplyGammaRampWhitePoint(stableId, gdiDevice, 0.50);
+            }
+        }
+        if (!applied && (method == WhitePointMethod::Magnification ||
+                         method == WhitePointMethod::Auto)) {
+            if (UpdateMagnificationWhitePoint(scale, true)) {
+                magActiveDisplays_.insert(stableId);
+                applied = true;
+            }
+        }
+        if (!applied) {
+            Log(L"whitePoint %ls: no supported method succeeded",
+                stableId.c_str());
+        }
+        return wroteDdc;
+    }
+
+    void RestoreAllWhitePoint() {
+        std::vector<std::tuple<std::wstring, HANDLE, std::wstring>> targets;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& d : displays_) {
+                targets.emplace_back(d.stableId, d.hPhysical, d.gdiDeviceName);
+            }
+        }
+        for (const auto& t : targets) {
+            RestoreDdcRgbGainWhitePoint(std::get<0>(t), std::get<1>(t));
+            RestoreGammaRampWhitePoint(std::get<0>(t), std::get<2>(t));
+        }
+        // Also restore any disconnected/untracked gamma ramps by key if possible.
+        savedGammaRamps_.clear();
+        savedRgbGain_.clear();
+        magActiveDisplays_.clear();
+        if (magInitialized_) {
+            UpdateMagnificationWhitePoint(1.0, false);
+        }
+        if (magModule_) {
+            FreeLibrary(magModule_);
+            magModule_ = nullptr;
+        }
+    }
+
+    Transport Apply(const std::wstring& stableId, int percent) {
+        HANDLE hPhysical = nullptr;
+        DWORD vcpMax = 100;
+        Transport transport = Transport::None;
+        std::wstring wmiPath;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& d : displays_) {
+                if (d.stableId == stableId) {
+                    transport = d.transport;
+                    hPhysical = d.hPhysical;
+                    vcpMax = d.vcpMax;
+                    wmiPath = d.wmiPath;
+                    break;
+                }
+            }
+        }
+
+        std::chrono::steady_clock::time_point start =
+            std::chrono::steady_clock::now();
+        bool ok = false;
+
+        switch (transport) {
+            case Transport::DdcCi: {
+                // Map the percentage onto the monitor's own scale, which is
+                // often not 0-100.
+                DWORD raw = static_cast<DWORD>(
+                    (static_cast<DWORD>(percent) * vcpMax + 50) / 100);
+                ok = SetVCPFeature(hPhysical, kVcpLuminance, raw) != FALSE;
+                break;
+            }
+            case Transport::Wmi:
+                ok = wmi_ && wmi_->SetBrightness(wmiPath, percent);
+                break;
+            case Transport::None:
+                break;
+        }
+
+        long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        writes_.fetch_add(1);  // @harness-only
+        // Unconditional: Windhawk's own per-mod logging switch already gates
+        // whether any of this is emitted, and it is off by default.
+        Log(L"apply %ls -> %d%% ok=%d (%lld ms)", stableId.c_str(), percent,
+            ok ? 1 : 0, ms);
+        return transport;
+    }
+
+    std::thread worker_;
+    std::thread eventThread_;
+    std::map<std::wstring, std::chrono::steady_clock::time_point> lastRequest_;
+    // What a DDC/CI probe last said about a display, and when.
+    //
+    // Worker thread only, so it needs no lock.
+    struct DdcVerdict {
+        bool answered = false;
+        int failures = 0;
+        std::chrono::steady_clock::time_point taken{};
+    };
+    std::map<std::wstring, DdcVerdict> ddcAnswered_;
+    FollowMode followMode_ = FollowMode::Off;
+    std::atomic<bool> stopping_{false};
+    std::mutex mutex_;
+    std::condition_variable work_;
+    std::condition_variable ready_;
+    std::map<std::wstring, int> pending_;
+    std::map<std::wstring, int> pendingContrast_;
+    std::map<std::wstring, bool> pendingPower_;
+    std::map<std::pair<std::wstring, BYTE>, DWORD> pendingVcp_;
+    std::map<std::wstring, bool> pendingWhitePoint_;
+    std::set<std::wstring> whitePointReducedIds_;
+    int whitePointReducePercent_ = 70;
+    WhitePointMethod whitePointMethod_ = WhitePointMethod::Auto;
+    bool whitePointScheduleEnabled_ = false;
+    int whitePointScheduleStartMin_ = 20 * 60;
+    int whitePointScheduleEndMin_ = 5 * 60;
+    bool whitePointScheduleEvalImmediate_ = false;
+    std::optional<bool> whitePointScheduleLastInWindow_;
+
+    // Worker-thread-only saved baselines for Reduce White Point.
+    struct RgbGainState {
+        DWORD rCur = 0, rMax = 0;
+        DWORD gCur = 0, gMax = 0;
+        DWORD bCur = 0, bMax = 0;
+    };
+    std::map<std::wstring, RgbGainState> savedRgbGain_;
+    std::map<std::wstring, std::array<WORD, 256 * 3>> savedGammaRamps_;
+    std::set<std::wstring> magActiveDisplays_;
+    HMODULE magModule_ = nullptr;
+    bool magInitialized_ = false;
+    // Capabilities read this session, by display, and how many reads have
+    // failed for the ones not read yet. Worker thread only.
+    static constexpr int kCapsAttempts = 3;
+    std::map<std::wstring, Capabilities> caps_;
+    std::map<std::wstring, int> capsAttempts_;
+
+    // Where relative following thinks each display would be if brightness had
+    // no end stops. Guarded by mutex_.
+    std::map<std::wstring, int> followRaw_;
+    std::vector<Display> displays_;
+    std::unique_ptr<WmiSession> wmi_;
+    LogFn log_ = nullptr;
+    std::atomic<unsigned> writes_{0};  // @harness-only
+    std::function<void(bool)> onChanged_;
+    bool quit_ = false;
+    bool rescan_ = false;
+    bool refresh_ = false;
+    bool enumerated_ = false;
+};
+
+}  // namespace brightness
